@@ -10,6 +10,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/zstd"
+	"github.com/mirkobrombin/go-foundation/pkg/options"
 	"github.com/mirkobrombin/go-slipstream/pkg/bloom"
 	"github.com/mirkobrombin/go-slipstream/pkg/index"
 	"github.com/mirkobrombin/go-slipstream/pkg/merkle"
@@ -97,10 +98,10 @@ type Engine[T any] struct {
 	dedup        map[uint64]int64
 }
 
-func New[T any](w *wal.Manager, codec func(T) ([]byte, error), decoder func([]byte) (T, error)) *Engine[T] {
+func New[T any](w *wal.Manager, codec func(T) ([]byte, error), decoder func([]byte) (T, error), opts ...Option[T]) *Engine[T] {
 	enc, _ := zstd.NewWriter(nil)
 	dec, _ := zstd.NewReader(nil)
-	return &Engine[T]{
+	e := &Engine[T]{
 		primary:    index.NewMapIndex(),
 		secondary:  index.NewSecondaryIndex[T](),
 		wal:        w,
@@ -113,6 +114,8 @@ func New[T any](w *wal.Manager, codec func(T) ([]byte, error), decoder func([]by
 		valueCache: cache.NewInMemory[T](cache.WithMaxEntries[T](100000)),
 		dedup:      make(map[uint64]int64),
 	}
+	options.Apply(e, opts...)
+	return e
 }
 
 func (e *Engine[T]) EnableDeduplication(v bool) {

@@ -3,6 +3,7 @@ package index
 import (
 	"sync"
 
+	"github.com/mirkobrombin/go-foundation/pkg/safemap"
 	"github.com/mirkobrombin/go-slipstream/pkg/index/btree"
 )
 
@@ -17,55 +18,49 @@ type Indexer interface {
 
 // MapIndex is a simple in-memory implementation of Indexer.
 type MapIndex struct {
-	mu   sync.RWMutex
-	data map[string]int64
+	data *safemap.Map[string, int64]
 }
 
 func NewMapIndex() *MapIndex {
 	return &MapIndex{
-		data: make(map[string]int64),
+		data: safemap.New[string, int64](),
 	}
 }
 
 func (m *MapIndex) Put(key string, offset int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.data[key] = offset
+	m.data.Set(key, offset)
 }
 
 func (m *MapIndex) Get(key string) (int64, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	off, ok := m.data[key]
-	return off, ok
+	return m.data.Get(key)
 }
 
 func (m *MapIndex) Delete(key string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.data, key)
+	m.data.Delete(key)
 }
 
 func (m *MapIndex) ForEach(fn func(key string, offset int64) error) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for k, v := range m.data {
+	var walkErr error
+	m.data.Range(func(k string, v int64) bool {
 		if err := fn(k, v); err != nil {
-			return err
+			walkErr = err
+			return false
 		}
-	}
-	return nil
+		return true
+	})
+	return walkErr
 }
 
 func (m *MapIndex) CompareAndSwap(key string, oldVal, newVal int64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	current, ok := m.data[key]
-	if !ok || current != oldVal {
-		return false
-	}
-	m.data[key] = newVal
-	return true
+	success := false
+	m.data.Compute(key, func(current int64, exists bool) int64 {
+		if !exists || current != oldVal {
+			return current
+		}
+		success = true
+		return newVal
+	})
+	return success
 }
 
 // SecondaryIndex manages inverted lookups.
