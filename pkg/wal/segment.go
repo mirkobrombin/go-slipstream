@@ -63,12 +63,50 @@ func (s *Segment) Write(data []byte) (int64, error) {
 
 	n, err := s.file.Write(data)
 	if err != nil {
-		return 0, err
+		// If O_DIRECT is enabled and we get Invalid Argument (EINVAL),
+		// it likely means the buffer is unaligned or FS doesn't support it strictly.
+		// Fallback to buffered I/O.
+		if s.direct && (os.IsPermission(err) || isInvalidArg(err)) {
+			if err := s.disableDirectIO(); err != nil {
+				return 0, fmt.Errorf("segment: fallback failed: %w", err)
+			}
+			// Retry write
+			n, err = s.file.Write(data)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			return 0, err
+		}
 	}
 
 	offset := s.size
 	s.size += int64(n)
 	return offset, nil
+}
+
+func (s *Segment) disableDirectIO() error {
+	s.file.Close()
+	flags := os.O_RDWR | os.O_APPEND | os.O_CREATE
+	f, err := os.OpenFile(s.path, flags, 0644)
+	if err != nil {
+		return err
+	}
+	s.file = f
+	s.direct = false
+	return nil
+}
+
+func isInvalidArg(err error) bool {
+	if serr, ok := err.(syscall.Errno); ok {
+		return serr == syscall.EINVAL
+	}
+	if perr, ok := err.(*os.PathError); ok {
+		if serr, ok := perr.Err.(syscall.Errno); ok {
+			return serr == syscall.EINVAL
+		}
+	}
+	return false
 }
 
 // ReadAt reads data from a specific offset.
