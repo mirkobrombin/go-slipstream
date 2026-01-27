@@ -14,12 +14,13 @@ import (
 
 // Manager handles a collection of WAL segments.
 type Manager struct {
-	mu      sync.RWMutex
-	dir     string
-	active  *Segment
-	sealed  []*Segment
-	txID    uint64
-	maxSize int64
+	mu          sync.RWMutex
+	dir         string
+	active      *Segment
+	sealed      []*Segment
+	txID        uint64
+	maxSize     int64
+	readBufPool *sync.Pool
 }
 
 // NewManager creates a new WAL manager.
@@ -32,6 +33,13 @@ func NewManager(dir string) (*Manager, error) {
 		dir:     dir,
 		maxSize: DefaultSegmentSize,
 		txID:    uint64(time.Now().UnixNano()),
+		readBufPool: &sync.Pool{
+			New: func() any {
+				// 4KB buffer for speculative reads (page aligned)
+				b := make([]byte, 4096)
+				return &b
+			},
+		},
 	}
 
 	if err := m.loadSegments(); err != nil {
@@ -167,41 +175,95 @@ func (m *Manager) ReadEntryAt(packedOffset int64) (Entry, error) {
 }
 
 func (m *Manager) readEntry(seg *Segment, offset int64) (Entry, error) {
-	// [Type:1][TxID:8][ExpiresAt:8][KeyLen:4][Key:N][ValueLen:4][Value:M]
-	header, err := seg.ReadAt(offset, 21)
-	if err != nil {
+	// Speculative read: fetch 4KB to avoid multiple syscalls
+	bufPtr := m.readBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer m.readBufPool.Put(bufPtr)
+
+	// Read up to buffer size or EOF (we don't know EOF yet, but ReadAt returns what it gets)
+	// We should just read 4KB. Segment logic handles boundaries?
+	// Segment.ReadAtBuffer uses file.ReadAt. file.ReadAt returns EOF if we read past.
+	// We need to know segment size or handle short read.
+	// But we passed offset.
+
+	// We try to read header (21 bytes) + some data.
+	n, err := seg.ReadAtBuffer(buf, offset)
+	if err != nil && n < 21 { // Need at least header
 		return Entry{}, err
 	}
 
-	entryType := header[0]
-	txID := binary.BigEndian.Uint64(header[1:])
-	expiresAt := int64(binary.BigEndian.Uint64(header[9:]))
+	if n < 21 {
+		return Entry{}, fmt.Errorf("wal: short read for header")
+	}
+
+	// [Type:1][TxID:8][ExpiresAt:8][KeyLen:4][Key:N][ValueLen:4][Value:M]
+	entryType := buf[0]
+	txID := binary.BigEndian.Uint64(buf[1:])
+	expiresAt := int64(binary.BigEndian.Uint64(buf[9:]))
 	if expiresAt > 0 && time.Now().UnixNano() > expiresAt {
 		return Entry{}, ErrNotFound
 	}
 
-	keyLen := binary.BigEndian.Uint32(header[17:])
-	keyBuf, err := seg.ReadAt(offset+21, int(keyLen))
-	if err != nil {
-		return Entry{}, err
+	keyLen := binary.BigEndian.Uint32(buf[17:])
+
+	totalKeyOffset := 21 + int64(keyLen)
+	// Do we have key in buffer?
+	// buf has 'n' bytes.
+	// We need 21 + keyLen <= n
+
+	var key string
+	if int64(n) >= totalKeyOffset {
+		// Key is in buffer
+		key = string(buf[21:totalKeyOffset])
+	} else {
+		// Key is partial or outside. Read explicitly.
+		kBuf := make([]byte, keyLen) // Allocation unavoidable for string conversion anyway? string(buf) copies.
+		// Use ReadAt for key
+		if _, err := seg.ReadAtBuffer(kBuf, offset+21); err != nil {
+			return Entry{}, err
+		}
+		key = string(kBuf)
 	}
 
-	vLenOffset := offset + 21 + int64(keyLen)
-	vLenBuf, err := seg.ReadAt(vLenOffset, 4)
-	if err != nil {
-		return Entry{}, err
-	}
-	valLen := binary.BigEndian.Uint32(vLenBuf)
+	// Value Length
+	// Offset: totalKeyOffset. Length: 4.
+	// Check if in buffer.
+	vLenStart := totalKeyOffset
+	vLenEnd := vLenStart + 4
 
-	val, err := seg.ReadAt(vLenOffset+4, int(valLen))
-	if err != nil {
-		return Entry{}, err
+	var valLen uint32
+	if int64(n) >= vLenEnd {
+		valLen = binary.BigEndian.Uint32(buf[vLenStart:vLenEnd])
+	} else {
+		// Read 4 bytes
+		vLenBuf := make([]byte, 4)
+		if _, err := seg.ReadAtBuffer(vLenBuf, offset+vLenStart); err != nil {
+			return Entry{}, err
+		}
+		valLen = binary.BigEndian.Uint32(vLenBuf)
+	}
+
+	// Value
+	valStart := vLenEnd
+	valEnd := valStart + int64(valLen)
+
+	var val []byte
+	if int64(n) >= valEnd {
+		// Value in buffer.
+		val = make([]byte, valLen)
+		copy(val, buf[valStart:valEnd])
+	} else {
+		// Value outside.
+		val = make([]byte, valLen)
+		if _, err := seg.ReadAtBuffer(val, offset+valStart); err != nil {
+			return Entry{}, err
+		}
 	}
 
 	return Entry{
 		Type:      entryType,
 		TxID:      txID,
-		Key:       string(keyBuf),
+		Key:       key,
 		Value:     val,
 		ExpiresAt: expiresAt,
 	}, nil

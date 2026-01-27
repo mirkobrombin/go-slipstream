@@ -31,7 +31,7 @@ type fsm[T any] struct {
 	decode func([]byte) (T, error)
 }
 
-func (f *fsm[T]) Apply(l *raft.Log) interface{} {
+func (f *fsm[T]) Apply(l *raft.Log) any {
 	var cmd command
 	if err := json.Unmarshal(l.Data, &cmd); err != nil {
 		slog.Error("raft fsm: failed to unmarshal command", "err", err)

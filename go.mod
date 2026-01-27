@@ -6,7 +6,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/hashicorp/raft v1.7.3
 	github.com/klauspost/compress v1.18.0
-	github.com/mirkobrombin/go-foundation v0.2.1
+	github.com/mirkobrombin/go-foundation v0.3.0
 	github.com/mirkobrombin/go-warp v1.0.0
 )
 

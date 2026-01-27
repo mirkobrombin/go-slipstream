@@ -137,6 +137,30 @@ func (s *Segment) ReadAt(offset int64, size int) ([]byte, error) {
 	return buf, nil
 }
 
+// ReadAtBuffer reads data into the provided buffer.
+// It returns the number of bytes read and any error.
+func (s *Segment) ReadAtBuffer(buf []byte, offset int64) (int, error) {
+	s.mu.RLock()
+	if s.file == nil {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		if s.file == nil {
+			flags := os.O_RDONLY
+			f, err := os.OpenFile(s.path, flags, 0644)
+			if err != nil {
+				s.mu.Unlock()
+				return 0, err
+			}
+			s.file = f
+		}
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
+	defer s.mu.RUnlock()
+
+	return s.file.ReadAt(buf, offset)
+}
+
 func (s *Segment) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

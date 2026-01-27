@@ -89,8 +89,8 @@ type Engine[T any] struct {
 	decoder    func([]byte) (T, error)
 	merkle     *merkle.Tree
 	bloom      *bloom.Filter
-	zEnc       *zstd.Encoder
-	zDec       *zstd.Decoder
+	encPool    *sync.Pool
+	decPool    *sync.Pool
 	valueCache cache.Cache[T]
 
 	// Deduplication
@@ -99,18 +99,26 @@ type Engine[T any] struct {
 }
 
 func New[T any](w *wal.Manager, codec func(T) ([]byte, error), decoder func([]byte) (T, error), opts ...Option[T]) *Engine[T] {
-	enc, _ := zstd.NewWriter(nil)
-	dec, _ := zstd.NewReader(nil)
 	e := &Engine[T]{
-		primary:    index.NewMapIndex(),
-		secondary:  index.NewSecondaryIndex[T](),
-		wal:        w,
-		codec:      codec,
-		decoder:    decoder,
-		merkle:     merkle.New(),
-		bloom:      bloom.New(1024*1024, 7),
-		zEnc:       enc,
-		zDec:       dec,
+		primary:   index.NewMapIndex(),
+		secondary: index.NewSecondaryIndex[T](),
+		wal:       w,
+		codec:     codec,
+		decoder:   decoder,
+		merkle:    merkle.New(),
+		bloom:     bloom.New(1024*1024, 7),
+		encPool: &sync.Pool{
+			New: func() any {
+				enc, _ := zstd.NewWriter(nil)
+				return enc
+			},
+		},
+		decPool: &sync.Pool{
+			New: func() any {
+				dec, _ := zstd.NewReader(nil)
+				return dec
+			},
+		},
 		valueCache: cache.NewInMemory[T](cache.WithMaxEntries[T](100000)),
 		dedup:      make(map[uint64]int64),
 	}
@@ -130,14 +138,16 @@ func (e *Engine[T]) Get(ctx context.Context, key string) (T, error) {
 	}
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-
+	// Bloom check before anything else
 	if !e.bloom.MayContain(key) {
+		e.mu.RUnlock()
 		var zero T
 		return zero, fmt.Errorf("engine: not found")
 	}
 
 	offset, ok := e.primary.Get(key)
+	e.mu.RUnlock() // Release lock for I/O and decompression
+
 	if !ok {
 		var zero T
 		return zero, fmt.Errorf("engine: not found")
@@ -163,7 +173,10 @@ func (e *Engine[T]) readAt(offset int64) (T, error) {
 		return e.readAt(targetOffset)
 	}
 
-	decompressed, err := e.zDec.DecodeAll(entry.Value, nil)
+	dec := e.decPool.Get().(*zstd.Decoder)
+	defer e.decPool.Put(dec)
+
+	decompressed, err := dec.DecodeAll(entry.Value, nil)
 	if err != nil {
 		return zero, err
 	}
@@ -172,19 +185,26 @@ func (e *Engine[T]) readAt(offset int64) (T, error) {
 
 func (e *Engine[T]) GetByIndex(ctx context.Context, indexName string, value string) *Result[T] {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-
+	// Get offsets first to minimize lock time
 	pks := e.secondary.Get(indexName, value)
-	if len(pks) == 0 {
+
+	// Collect primary offsets
+	offsets := make([]int64, 0, len(pks))
+	for _, pk := range pks {
+		if offset, ok := e.primary.Get(pk); ok {
+			offsets = append(offsets, offset)
+		}
+	}
+	e.mu.RUnlock()
+
+	if len(offsets) == 0 {
 		return &Result[T]{data: nil}
 	}
 
-	results := make([]T, 0, len(pks))
-	for _, pk := range pks {
-		if offset, ok := e.primary.Get(pk); ok {
-			if val, err := e.readAt(offset); err == nil {
-				results = append(results, val)
-			}
+	results := make([]T, 0, len(offsets))
+	for _, offset := range offsets {
+		if val, err := e.readAt(offset); err == nil {
+			results = append(results, val)
 		}
 	}
 
@@ -196,19 +216,22 @@ func (e *Engine[T]) AddIndex(name string, extractor func(T) string) {
 }
 
 func (e *Engine[T]) Put(ctx context.Context, key string, value T, ttl time.Duration) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	data, err := e.codec(value)
 	if err != nil {
 		return err
 	}
-	compressed := e.zEnc.EncodeAll(data, nil)
+
+	enc := e.encPool.Get().(*zstd.Encoder)
+	compressed := enc.EncodeAll(data, nil)
+	e.encPool.Put(enc)
 
 	var expiresAt int64
 	if ttl > 0 {
 		expiresAt = time.Now().Add(ttl).UnixNano()
 	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	if oldOffset, ok := e.primary.Get(key); ok {
 		if oldVal, err := e.readAt(oldOffset); err == nil {
@@ -250,7 +273,7 @@ func (e *Engine[T]) Put(ctx context.Context, key string, value T, ttl time.Durat
 	}
 
 	e.primary.Put(key, offset)
-	e.merkle.Update(key, data)
+	e.merkle.Update(key, data) // Merkle uses original data
 	e.bloom.Add(key)
 	e.secondary.Update(key, value)
 
@@ -306,7 +329,10 @@ func (b *btx[T]) Get(ctx context.Context, key string) (T, error) {
 
 func (b *btx[T]) Put(ctx context.Context, key string, value T, ttl time.Duration) error {
 	data, _ := b.engine.codec(value)
-	compressed := b.engine.zEnc.EncodeAll(data, nil)
+
+	enc := b.engine.encPool.Get().(*zstd.Encoder)
+	compressed := enc.EncodeAll(data, nil)
+	b.engine.encPool.Put(enc)
 
 	var expiresAt int64
 	if ttl > 0 {
@@ -375,7 +401,10 @@ func (b *btx[T]) Commit(ctx context.Context) error {
 			b.engine.merkle.Update(op.Key, op.Value)
 			b.engine.bloom.Add(op.Key)
 
-			decomp, _ := b.engine.zDec.DecodeAll(op.Value, nil)
+			dec := b.engine.decPool.Get().(*zstd.Decoder)
+			decomp, _ := dec.DecodeAll(op.Value, nil)
+			b.engine.decPool.Put(dec)
+
 			val, _ := b.engine.decoder(decomp)
 			b.engine.secondary.Update(op.Key, val)
 		} else {
@@ -426,16 +455,17 @@ func (e *Engine[T]) Recover() error {
 			return nil
 		}
 
-		if entry.Type == wal.EntryPut {
+		switch entry.Type {
+		case wal.EntryPut:
 			e.primary.Put(entry.Key, offset)
 			e.bloom.Add(entry.Key)
 			if e.dedupEnabled {
 				h := xxhash.Sum64(entry.Value)
 				e.dedup[h] = offset
 			}
-		} else if entry.Type == wal.EntryLink {
+		case wal.EntryLink:
 			e.primary.Put(entry.Key, offset)
-		} else if entry.Type == wal.EntryDelete {
+		case wal.EntryDelete:
 			e.primary.Delete(entry.Key)
 			e.merkle.Delete(entry.Key)
 		}
