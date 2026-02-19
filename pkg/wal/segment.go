@@ -111,30 +111,43 @@ func isInvalidArg(err error) bool {
 
 // ReadAt reads data from a specific offset.
 func (s *Segment) ReadAt(offset int64, size int) ([]byte, error) {
-	s.mu.RLock()
-	if s.file == nil {
-		s.mu.RUnlock()
-		s.mu.Lock()
-		if s.file == nil {
-			flags := os.O_RDONLY
-			// Rely on OS page cache for read speed
-			f, err := os.OpenFile(s.path, flags, 0644)
-			if err != nil {
-				s.mu.Unlock()
-				return nil, err
-			}
-			s.file = f
-		}
-		s.mu.Unlock()
+	for {
 		s.mu.RLock()
-	}
-	defer s.mu.RUnlock()
+		f := s.file
+		direct := s.direct
+		s.mu.RUnlock()
 
-	buf := make([]byte, size)
-	if _, err := s.file.ReadAt(buf, offset); err != nil {
-		return nil, err
+		if f == nil {
+			s.mu.Lock()
+			if s.file == nil {
+				flags := os.O_RDONLY
+				// Rely on OS page cache for read speed
+				newFile, err := os.OpenFile(s.path, flags, 0644)
+				if err != nil {
+					s.mu.Unlock()
+					return nil, err
+				}
+				s.file = newFile
+			}
+			s.mu.Unlock()
+			continue
+		}
+
+		buf := make([]byte, size)
+		if _, err := f.ReadAt(buf, offset); err != nil {
+			if direct && isInvalidArg(err) {
+				s.mu.Lock()
+				if err := s.disableDirectIO(); err != nil {
+					s.mu.Unlock()
+					return nil, fmt.Errorf("segment: fallback read failed: %w", err)
+				}
+				s.mu.Unlock()
+				continue
+			}
+			return nil, err
+		}
+		return buf, nil
 	}
-	return buf, nil
 }
 
 // ReadAtBuffer reads data into the provided buffer.
