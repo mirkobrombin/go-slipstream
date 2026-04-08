@@ -463,9 +463,32 @@ func (e *Engine[T]) Recover() error {
 				h := xxhash.Sum64(entry.Value)
 				e.dedup[h] = offset
 			}
+			// Rebuild secondary indices from the stored value.
+			dec := e.decPool.Get().(*zstd.Decoder)
+			decompressed, err := dec.DecodeAll(entry.Value, nil)
+			e.decPool.Put(dec)
+			if err == nil {
+				if val, err := e.decoder(decompressed); err == nil {
+					e.secondary.Update(entry.Key, val)
+				}
+			}
 		case wal.EntryLink:
 			e.primary.Put(entry.Key, offset)
+			// Follow the link to decode the real value so secondary indices
+			// are rebuilt even for deduplicated entries.
+			targetOffset := int64(binary.BigEndian.Uint64(entry.Value))
+			if val, err := e.readAt(targetOffset); err == nil {
+				e.secondary.Update(entry.Key, val)
+			}
 		case wal.EntryDelete:
+			// Remove from secondary indices before deleting from primary.
+			if oldOffset, ok := e.primary.Get(entry.Key); ok {
+				if oldVal, err := e.readAt(oldOffset); err == nil {
+					for name, extractor := range e.secondary.Extractors() {
+						e.secondary.RemoveEntry(name, extractor(oldVal), entry.Key)
+					}
+				}
+			}
 			e.primary.Delete(entry.Key)
 			e.merkle.Delete(entry.Key)
 		}
