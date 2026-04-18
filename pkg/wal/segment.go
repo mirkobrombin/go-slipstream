@@ -153,25 +153,38 @@ func (s *Segment) ReadAt(offset int64, size int) ([]byte, error) {
 // ReadAtBuffer reads data into the provided buffer.
 // It returns the number of bytes read and any error.
 func (s *Segment) ReadAtBuffer(buf []byte, offset int64) (int, error) {
-	s.mu.RLock()
-	if s.file == nil {
-		s.mu.RUnlock()
-		s.mu.Lock()
-		if s.file == nil {
-			flags := os.O_RDONLY
-			f, err := os.OpenFile(s.path, flags, 0644)
-			if err != nil {
-				s.mu.Unlock()
-				return 0, err
-			}
-			s.file = f
-		}
-		s.mu.Unlock()
+	for {
 		s.mu.RLock()
-	}
-	defer s.mu.RUnlock()
+		if s.file == nil {
+			s.mu.RUnlock()
+			s.mu.Lock()
+			if s.file == nil {
+				f, err := os.OpenFile(s.path, os.O_RDONLY, 0644)
+				if err != nil {
+					s.mu.Unlock()
+					return 0, err
+				}
+				s.file = f
+			}
+			s.mu.Unlock()
+			continue
+		}
+		f := s.file
+		direct := s.direct
+		s.mu.RUnlock()
 
-	return s.file.ReadAt(buf, offset)
+		n, err := f.ReadAt(buf, offset)
+		if err != nil && direct && isInvalidArg(err) {
+			s.mu.Lock()
+			if derr := s.disableDirectIO(); derr != nil {
+				s.mu.Unlock()
+				return n, fmt.Errorf("segment: fallback read failed: %w", derr)
+			}
+			s.mu.Unlock()
+			continue
+		}
+		return n, err
+	}
 }
 
 func (s *Segment) Close() error {
