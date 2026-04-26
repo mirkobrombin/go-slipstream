@@ -150,7 +150,7 @@ func (h *HybridIndex) Put(key string, offset int64) {
 	defer h.mu.Unlock()
 
 	h.hot[key] = offset
-	if len(h.hot) > h.threshold {
+	for len(h.hot) > h.threshold {
 		h.spill()
 	}
 }
@@ -177,7 +177,7 @@ func (h *HybridIndex) spill() {
 			_ = h.cold.Put([]byte(k), v)
 		}
 		delete(h.hot, k)
-		break
+		return
 	}
 }
 
@@ -195,23 +195,7 @@ func (h *HybridIndex) ForEach(fn func(key string, offset int64) error) error {
 			return err
 		}
 	}
-	// Also iterate disk overflow (stubbed)
 	return nil
-}
-
-func (h *HybridIndex) spillToDisk() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.cold == nil {
-		return
-	}
-
-	for k, v := range h.hot {
-		_ = h.cold.Put([]byte(k), v)
-	}
-	// Clear hot map after spilling
-	h.hot = make(map[string]int64)
 }
 
 func (h *HybridIndex) CompareAndSwap(key string, oldVal, newVal int64) bool {
