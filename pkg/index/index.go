@@ -3,7 +3,7 @@ package index
 import (
 	"sync"
 
-	"github.com/mirkobrombin/go-foundation/pkg/safemap"
+	"github.com/mirkobrombin/go-foundation/v2/core/safemap"
 	"github.com/mirkobrombin/go-slipstream/pkg/index/btree"
 )
 
@@ -125,7 +125,21 @@ func (s *SecondaryIndex[T]) Get(name string, fieldVal string) []string {
 }
 
 func (s *SecondaryIndex[T]) Extractors() map[string]func(T) string {
-	return s.extractors
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	copy := make(map[string]func(T) string, len(s.extractors))
+	for name, extractor := range s.extractors {
+		copy[name] = extractor
+	}
+	return copy
+}
+
+func (s *SecondaryIndex[T]) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for name := range s.extractors {
+		s.indices[name] = make(map[string]map[string]struct{})
+	}
 }
 
 // HybridIndex is an adaptive indexer that spills to disk when memory limit is reached.

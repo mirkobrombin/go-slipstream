@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/mirkobrombin/go-slipstream/pkg/tx"
 )
 
 // Slipstream is a thread-safe wrapper that manages persistence.
@@ -53,6 +55,24 @@ func (s *Slipstream[T]) Put(ctx context.Context, key string, value T, ttl time.D
 	return s.engine.Put(ctx, key, value, ttl)
 }
 
+func (s *Slipstream[T]) PutIfAbsent(ctx context.Context, key string, value T, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.engine.PutIfAbsent(ctx, key, value, ttl)
+}
+
+func (s *Slipstream[T]) PutIf(ctx context.Context, key string, value T, ttl time.Duration, condition tx.Condition[T]) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.engine.PutIf(ctx, key, value, ttl, condition)
+}
+
 func (s *Slipstream[T]) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -62,6 +82,33 @@ func (s *Slipstream[T]) Delete(ctx context.Context, key string) error {
 	}
 
 	return s.engine.Delete(ctx, key)
+}
+
+func (s *Slipstream[T]) DeleteIf(ctx context.Context, key string, condition tx.Condition[T]) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.engine.DeleteIf(ctx, key, condition)
+}
+
+func (s *Slipstream[T]) Begin() (tx.Transaction[T], error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.engine.Begin()
+}
+
+func (s *Slipstream[T]) BeginConditional() (tx.ConditionalTransaction[T], error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.engine.BeginConditional()
 }
 
 func (s *Slipstream[T]) Close() error {

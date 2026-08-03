@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"github.com/mirkobrombin/go-foundation/pkg/options"
+	"github.com/mirkobrombin/go-foundation/v2/core/options"
 	"github.com/mirkobrombin/go-slipstream/pkg/bloom"
 	"github.com/mirkobrombin/go-warp/v1/cache"
 )

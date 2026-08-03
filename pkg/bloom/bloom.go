@@ -38,6 +38,10 @@ func (b *Filter) MayContain(key string) bool {
 	return true
 }
 
+func (b *Filter) Reset() {
+	clear(b.bitset)
+}
+
 func (b *Filter) hash(key string, seed int) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(key))

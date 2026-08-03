@@ -2,8 +2,10 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/mirkobrombin/go-slipstream/pkg/wal"
 )
 
@@ -21,53 +23,78 @@ func (e *Engine[T]) StartCompactor(interval time.Duration) {
 }
 
 func (e *Engine[T]) Compact() error {
-	sealed := e.wal.SealedSegments()
-	if len(sealed) == 0 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.wal.SealedSegments()) == 0 {
 		return nil
 	}
 
-	for _, seg := range sealed {
-		if err := e.compactSegment(seg); err != nil {
+	if err := e.wal.Rotate(); err != nil {
+		return err
+	}
+	sources := e.wal.SealedSegments()
+	type currentEntry struct {
+		key       string
+		offset    int64
+		expiresAt int64
+		value     []byte
+	}
+	current := make([]currentEntry, 0)
+	if err := e.primary.ForEach(func(key string, offset int64) error {
+		head, err := e.wal.ReadEntryAt(offset)
+		if err != nil {
 			return err
 		}
+		compressed, err := e.compressedAt(offset)
+		if err != nil {
+			return err
+		}
+		current = append(current, currentEntry{
+			key:       key,
+			offset:    offset,
+			expiresAt: head.ExpiresAt,
+			value:     compressed,
+		})
+		return nil
+	}); err != nil {
+		return err
 	}
-	return nil
-}
 
-func (e *Engine[T]) compactSegment(seg *wal.Segment) error {
-	err := e.wal.IterateSegment(seg, func(entry wal.Entry, offset int64) error {
-		if entry.Type != 0 {
-			return nil
-		}
-
-		currentOff, ok := e.primary.Get(entry.Key)
-		if !ok || currentOff != offset {
-			return nil
-		}
-
+	for _, entry := range current {
 		newOffset, err := e.wal.Append(wal.Entry{
-			Type:  0,
-			Key:   entry.Key,
-			Value: entry.Value,
+			Type:      wal.EntryPut,
+			Key:       entry.key,
+			Value:     entry.value,
+			ExpiresAt: entry.expiresAt,
 		})
 		if err != nil {
 			return err
 		}
-
-		swapped := e.primary.CompareAndSwap(entry.Key, offset, newOffset)
-		if !swapped {
-			// If CompareAndSwap fails, it means a concurrent Put/Delete
-			// has already updated the Primary Index, the entry is now stale (garbage),
-			// and the user's update prevails, simply discard this compacted entry.
-		}
-
-		return nil
-	})
-
-	if err != nil {
+		e.primary.Put(entry.key, newOffset)
+	}
+	if err := e.wal.Sync(); err != nil {
 		return err
 	}
+	sort.Slice(sources, func(i, j int) bool { return sources[i].ID() > sources[j].ID() })
+	for _, segment := range sources {
+		if err := e.wal.RemoveSegment(segment.ID()); err != nil {
+			return err
+		}
+	}
+	return e.rebuildDedupLocked()
+}
 
-	// Safe to remove the segment
-	return e.wal.RemoveSegment(seg.ID())
+func (e *Engine[T]) rebuildDedupLocked() error {
+	e.dedup = make(map[uint64]int64)
+	if !e.dedupEnabled {
+		return nil
+	}
+	return e.primary.ForEach(func(_ string, offset int64) error {
+		compressed, err := e.compressedAt(offset)
+		if err != nil {
+			return err
+		}
+		e.dedup[xxhash.Sum64(compressed)] = offset
+		return nil
+	})
 }

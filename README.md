@@ -2,7 +2,7 @@
 
 **Go-Slipstream** is a high-performance, distributed embedded database for Go. It combines the simplicity of Bitcask with advanced industrial features like ACID transactions, secondary indexing, and transparent compression.
 
-Built to be "Warp-Native", it serves as the ultimate persistence layer for [go-warp](https://github.com/mirkobrombin/go-warp), providing bare-metal performance through `O_DIRECT` and cluster-wide consistency via **Raft** and Merkle Tree anti-entropy.
+Built to be "Warp-Native", it serves as a persistence layer for [go-warp](https://github.com/mirkobrombin/go-warp), with `O_DIRECT` where supported, Raft replication, and Merkle root divergence detection.
 
 - **Strong Consistency**: Integrated **Raft** consensus for linearizable operations across the cluster.
 - **ACID Transactions**: Atomic `Begin/Commit/Rollback` operations with write-ahead protection.
@@ -52,6 +52,7 @@ go run ./examples/bench -target slipstream -n 100000 -c 50
 - **[Architecture Overview](docs/architecture.md)**: WAL, O_DIRECT, and the Bitcask engine.
 - **[Raft Consensus](docs/raft.md)**: Strong consistency and leader election.
 - **[ACID Transactions](docs/acid.md)**: Understanding the transaction model and markers.
+- **[Process Safety](docs/process-safety.md)**: Exclusive directory ownership across processes.
 - **[Secondary Indices](docs/indexes.md)**: Querying by fields other than the primary key.
 - **[Performance & Optimization](docs/optimization.md)**: Bloom Filters, Compression, and Compaction.
 - **[Warp Integration](docs/distributed.md)**: Distributed anti-entropy and syncbus gossip.
@@ -75,7 +76,8 @@ import (
 )
 
 func main() {
-    w, _ := wal.New("data.log")
+    w, _ := wal.NewManager("data")
+    defer w.Close()
     db := engine.NewBitcask[string](w, 
         func(s string) ([]byte, error) { return []byte(s), nil },
         func(b []byte) (string, error) { return string(b), nil },
@@ -83,7 +85,7 @@ func main() {
     
     ctx := context.Background()
 
-    db.Put(ctx, "hello", "world")
+    db.Put(ctx, "hello", "world", 0)
     val, _ := db.Get(ctx, "hello")
 }
 ```
@@ -91,9 +93,18 @@ func main() {
 ### ACID Transactions
 ```go
 tx, _ := db.Begin()
-tx.Put(ctx, "balance:A", "90")
-tx.Put(ctx, "balance:B", "110")
+tx.Put(ctx, "balance:A", "90", 0)
+tx.Put(ctx, "balance:B", "110", 0)
 tx.Commit(ctx) // Atomic
+```
+
+### Conditional Writes
+```go
+err := db.PutIf(ctx, "account:1", next, 0,
+    func(current Account, exists bool) bool {
+        return exists && current.Version == expectedVersion
+    },
+)
 ```
 
 ### Secondary Indices

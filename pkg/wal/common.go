@@ -2,7 +2,9 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 )
 
 const (
@@ -23,10 +25,41 @@ type Entry struct {
 }
 
 var (
-	ErrSegmentFull = fmt.Errorf("wal: segment full")
-	ErrClosed      = fmt.Errorf("wal: closed")
-	ErrNotFound    = fmt.Errorf("wal: not found")
+	ErrSegmentFull     = fmt.Errorf("wal: segment full")
+	ErrClosed          = fmt.Errorf("wal: closed")
+	ErrNotFound        = fmt.Errorf("wal: not found")
+	ErrCorrupt         = errors.New("wal: corrupt entry")
+	ErrDirectoryLocked = errors.New("wal: directory is already open")
+	ErrEntryTooLarge   = errors.New("wal: entry exceeds encoding limits")
+	ErrTornWrite       = errors.New("wal: torn active-segment write")
 )
+
+const (
+	checksummedEntryFlag        byte = 0x80
+	checksummedHeaderSize            = 29
+	checksummedMinimumEntrySize      = 37
+)
+
+var checksumTable = crc32.MakeTable(crc32.Castagnoli)
+
+// CorruptionError identifies a malformed WAL record.
+type CorruptionError struct {
+	SegmentID uint64
+	Offset    int64
+	Cause     error
+}
+
+func (e *CorruptionError) Error() string {
+	return fmt.Sprintf("wal: corrupt entry in segment %d at offset %d: %v", e.SegmentID, e.Offset, e.Cause)
+}
+
+func (e *CorruptionError) Unwrap() error {
+	return e.Cause
+}
+
+func (e *CorruptionError) Is(target error) bool {
+	return target == ErrCorrupt || errors.Is(e.Cause, target)
+}
 
 const (
 	// SegmentSizeBytes is the default max size for segments.
@@ -47,22 +80,26 @@ func UnpackOffset(packed int64) (uint64, int64) {
 	return id, offset
 }
 
-// EncodeEntry binary encodes an entry.
-// [Type:1][TxID:8][ExpiresAt:8][KeyLen:4][Key:N][ValueLen:4][Value:M]
+// EncodeEntry binary encodes a checksummed entry. The decoder also accepts the
+// legacy unframed format written before v1.1.0.
 func EncodeEntry(e Entry) []byte {
 	keyLen := len(e.Key)
 	valLen := len(e.Value)
-	buf := make([]byte, 1+8+8+4+keyLen+4+valLen)
+	totalLen := checksummedMinimumEntrySize + keyLen + valLen
+	buf := make([]byte, totalLen)
 
-	buf[0] = e.Type
-	binary.BigEndian.PutUint64(buf[1:], e.TxID)
-	binary.BigEndian.PutUint64(buf[9:], uint64(e.ExpiresAt))
-	binary.BigEndian.PutUint32(buf[17:], uint32(keyLen))
-	copy(buf[21:], e.Key)
+	buf[0] = e.Type | checksummedEntryFlag
+	binary.BigEndian.PutUint32(buf[1:], uint32(totalLen))
+	binary.BigEndian.PutUint64(buf[5:], e.TxID)
+	binary.BigEndian.PutUint64(buf[13:], uint64(e.ExpiresAt))
+	binary.BigEndian.PutUint32(buf[21:], uint32(keyLen))
+	binary.BigEndian.PutUint32(buf[25:], crc32.Checksum(buf[:25], checksumTable))
+	copy(buf[checksummedHeaderSize:], e.Key)
 
-	vOffset := 21 + keyLen
+	vOffset := checksummedHeaderSize + keyLen
 	binary.BigEndian.PutUint32(buf[vOffset:], uint32(valLen))
 	copy(buf[vOffset+4:], e.Value)
+	binary.BigEndian.PutUint32(buf[totalLen-4:], crc32.Checksum(buf[:totalLen-4], checksumTable))
 
 	return buf
 }

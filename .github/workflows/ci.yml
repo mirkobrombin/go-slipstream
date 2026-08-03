@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: "1.25.12"
+  EUPROVGUARD_VERSION: "v1.1.0"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run tests three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run in 1 2 3; do
+            go test -count=1 -shuffle=on -timeout=3m ./...
+          done
+
+      - name: Run tests with race detector
+        run: go test -race -count=1 -timeout=5m ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+  compliance:
+    name: Compliance
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install EUProvGuard
+        run: go install github.com/fabricatorsltd/euprovguard@${{ env.EUPROVGUARD_VERSION }}
+
+      - name: Resolve project version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "value=0.0.0-${GITHUB_SHA:0:7}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Scan module
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p compliance
+          euprovguard \
+            -path . \
+            -name go-slipstream \
+            -version-tag "${{ steps.version.outputs.value }}" \
+            -output compliance/sbom.json \
+            -bundle compliance/report 2>&1 | tee compliance/scan.log
+
+      # EUProvGuard exits 0 even when it reports findings, so the gate reads its
+      # output. A scan that cannot be parsed or cannot reach the vulnerability
+      # databases fails because its result cannot be verified.
+      - name: Fail on compliance findings
+        shell: bash
+        run: |
+          set -euo pipefail
+          sbom="compliance/sbom.json"
+          log="compliance/scan.log"
+
+          recorded=$(jq '(.vulnerabilities // []) | length' "${sbom}")
+          cves=$(sed -n 's/.*CVE findings: \([0-9][0-9]*\).*/\1/p' "${log}" | tail -n 1)
+          sast=$(sed -n 's/.*Native SAST completed: found \([0-9][0-9]*\) issues.*/\1/p' "${log}" | tail -n 1)
+
+          echo "module: sbom=${recorded} cve=${cves:-missing} sast=${sast:-missing}"
+
+          if [ -z "${cves}" ] || [ -z "${sast}" ]; then
+            echo "::error::EUProvGuard summary could not be parsed"
+            exit 1
+          fi
+          if grep -q "OSV/EUVD query failed" "${log}"; then
+            echo "::error::vulnerability databases were unreachable"
+            exit 1
+          fi
+          if [ "${recorded}" -gt 0 ] || [ "${cves}" -gt 0 ] || [ "${sast}" -gt 0 ]; then
+            echo "::error::EUProvGuard reported findings"
+            exit 1
+          fi
+
+      - name: Upload compliance artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: compliance-reports
+          path: compliance/
+          if-no-files-found: error

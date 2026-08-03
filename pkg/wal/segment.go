@@ -1,7 +1,9 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"syscall"
@@ -21,7 +23,8 @@ type Segment struct {
 
 // NewSegment creates or opens a segment.
 func NewSegment(id uint64, path string, maxSize int64) (*Segment, error) {
-	flags := os.O_RDWR | os.O_APPEND | os.O_CREATE | syscall.O_DIRECT
+	directFlag := directOpenFlag()
+	flags := os.O_RDWR | os.O_APPEND | os.O_CREATE | directFlag
 	f, err := os.OpenFile(path, flags, 0644)
 	if err != nil {
 		// Fallback for systems without O_DIRECT (e.g. some containers/FS)
@@ -44,7 +47,7 @@ func NewSegment(id uint64, path string, maxSize int64) (*Segment, error) {
 		file:    f,
 		size:    stat.Size(),
 		maxSize: maxSize,
-		direct:  (flags & syscall.O_DIRECT) != 0,
+		direct:  directFlag != 0,
 	}, nil
 }
 
@@ -61,6 +64,7 @@ func (s *Segment) Write(data []byte) (int64, error) {
 		return 0, ErrSegmentFull
 	}
 
+	offset := s.size
 	n, err := s.file.Write(data)
 	if err != nil {
 		// If O_DIRECT is enabled and we get Invalid Argument (EINVAL),
@@ -73,16 +77,38 @@ func (s *Segment) Write(data []byte) (int64, error) {
 			// Retry write
 			n, err = s.file.Write(data)
 			if err != nil {
+				if n > 0 {
+					err = errors.Join(err, s.file.Truncate(offset))
+				}
 				return 0, err
 			}
 		} else {
+			if n > 0 {
+				err = errors.Join(err, s.file.Truncate(offset))
+			}
 			return 0, err
 		}
 	}
+	if n != len(data) {
+		return 0, errors.Join(io.ErrShortWrite, s.file.Truncate(offset))
+	}
 
-	offset := s.size
 	s.size += int64(n)
 	return offset, nil
+}
+
+func (s *Segment) Truncate(size int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed || s.file == nil {
+		return ErrClosed
+	}
+	if err := s.file.Truncate(size); err != nil {
+		return err
+	}
+	s.size = size
+	return nil
 }
 
 func (s *Segment) disableDirectIO() error {

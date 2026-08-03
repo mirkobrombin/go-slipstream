@@ -1,38 +1,26 @@
-# Distributed Anti-Entropy
+# Distributed State
 
-Go-Slipstream is designed to live in a cluster. When integrated with [go-warp](https://github.com/mirkobrombin/go-warp), it provides a robust mechanism to ensure all nodes are in sync.
+Go-Slipstream has two separate distributed building blocks: Merkle root gossip for divergence detection and Raft for replicated writes.
 
-## Merkle Tree Sync
+## Merkle root gossip
 
-Every Go-Slipstream instance maintains a local **Merkle Tree**.
-- Every operation updates a leaf in the tree.
-- The **Root Hash** represents the unique state of the entire database.
-
-### The Gossip Cycle
-1. Every node periodically calculates its `MerkleRoot()`.
-2. This hash is published to the `warp:syncbus` with a key like `slipstream:root:<node_id>`.
-3. Other nodes receive this hash and compare it with their own root.
-4. **Divergence Detected**: If the hashes don't match, the nodes identify the missing data and synchronize.
-
-## Warp SyncManager
-
-Go-Slipstream includes a `SyncManager` that simplifies this integration:
+Every engine maintains a local Merkle tree. `SyncManager` periodically publishes the local root through a go-warp sync bus and compares received roots with its own.
 
 ```go
-import "github.com/mirkobrombin/go-slipstream/pkg/sync"
+import slipstreamsync "github.com/mirkobrombin/go-slipstream/pkg/sync"
 
-manager := sync.NewManager(engine, bus, 10*time.Second)
-manager.Start(ctx) 
+manager := slipstreamsync.NewManager(engine, bus, 10*time.Second)
+manager.Start(ctx)
 ```
 
-## Consistency Guarantees
+The current `SyncManager` detects and logs divergence. It does not locate differing keys, transfer records, or reconcile nodes. Applications must not claim eventual convergence from this component alone.
 
-While Go-Slipstream provides local ACID transactions, distributed consistency is handled via **Anti-Entropy**:
-- **Eventually Consistent**: Nodes will converge to the same state after sync cycles.
-- **Causal Ordering**: Leveraging Warp's Vector Clocks to ensure operations are applied in the correct order across the cluster.
+Warp sync buses carry invalidation keys and metadata. They do not replicate Slipstream values. A service can combine Warp with the Slipstream store adapter, but it must define data ownership, routing, and conflict behavior explicitly.
 
-## Strong Consistency (Raft)
+## Raft replication
 
-For workloads requiring Strong Consistency (CP), Go-Slipstream provides a foundation for **Raft** integration.
-- The `RaftManager` can be used to replicate WAL entries across a quorum of nodes before committing them locally.
-- Note: Full Raft integration is an advanced feature currently in the foundational stage.
+The Raft package replicates put and delete commands through Hashicorp Raft. The leader commits a command to the Raft log, then each node applies it to its local Slipstream engine.
+
+The application API remains in-process. Slipstream does not provide an HTTP, gRPC, or RESP client endpoint for Raft leaders, and followers do not forward proposals. A remote deployment needs an application service that discovers or routes to the current leader.
+
+Raft provides the implemented replicated-write path. Merkle root gossip is currently a detection mechanism, not an alternative replication protocol.
