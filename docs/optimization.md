@@ -25,9 +25,10 @@ To avoid expensive "Cold Reads" (searching for keys that don't exist), Go-Slipst
 Every update in a Bitcask engine appends new data, leaving the old data as "garbage" in the WAL. The **Compactor** solves this.
 
 - **Process**:
-    1. The Compactor scans the in-memory **KeyDir**.
-    2. It copies only the latest "live" values into a new, temporary WAL file.
-    3. It atomically swaps the old WAL with the new, compacted one.
+    1. The Compactor seals the active segment.
+    2. It copies each current KeyDir value into new WAL segments as a standalone put.
+    3. It syncs the rewritten state.
+    4. It removes source segments from newest to oldest so deduplication links never outlive their targets.
 - **Result**: The WAL size remains proportional to the amount of *live* data, not the total history of operations.
 
 ## Bare-Metal I/O (O_DIRECT)
@@ -35,4 +36,4 @@ Every update in a Bitcask engine appends new data, leaving the old data as "garb
 Where supported (Linux), Go-Slipstream opens files with the `O_DIRECT` flag.
 - **Zero Kernel Overhead**: Bypasses the kernel's Page Cache.
 - **Direct-to-Disk**: Minimizes CPU usage and latency for write operations.
-- **Alignment**: Requires writes to be aligned to the hardware page size (`4096 bytes`), which Go-Slipstream manages automatically via aligned buffers.
+- **Fallback**: If the filesystem rejects an unaligned or unsupported direct operation, the segment is reopened with buffered I/O and the operation is retried.

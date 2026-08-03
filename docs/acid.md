@@ -1,45 +1,84 @@
-# ACID Transactions
+# Transactions and Conditional Writes
 
-Go-Slipstream provides full ACID (Atomicity, Consistency, Isolation, Durability) guarantees for multi-key operations via its transaction API.
+Go-Slipstream buffers transaction operations in memory and appends them to the WAL under one transaction ID. A commit marker follows the operations. Recovery applies the operations only when that marker is present, so a crash before the marker leaves no partial transaction state.
 
-## Transaction Model
+## Transaction model
 
-Transactions in Go-Slipstream are **Optimistic** and **Buffered**:
-1. **Begin**: Starts a new transaction with a unique `TxID`.
-2. **Operations**: `Put` and `Delete` are buffered in memory and not yet visible to other readers.
-3. **Commit**: All operations are flushed to the WAL sequentially, followed by a special **Commit Marker**.
-4. **Rollback**: Clears the buffers without touching the disk or KeyDir.
+1. `Begin` allocates a transaction ID.
+2. `Put` and `Delete` buffer operations. A transaction reads its own buffered writes.
+3. `Commit` appends the operations and commit marker, syncs the WAL, then publishes the new in-memory state.
+4. `Rollback` discards the buffer without a WAL write.
 
-## The Atomic Commit Marker
-
-The secret to Go-Slipstream's reliability is the **Commit Marker** in the WAL.
-- During recovery (not yet fully implemented in this POC, but the foundation is there), the engine scans the WAL.
-- Entries belonging to a `TxID` are only applied if a matching `Commit` entry is found at the end of the sequence.
-- This ensures that partial writes (e.g., due to power failure) never corrupt the database state.
-
-## Usage Example
+The engine provides read-committed isolation. Transactions do not track a general read set and do not detect conflicts unless commit-time conditions are declared.
 
 ```go
-tx, err := db.Begin()
+transaction, err := db.Begin()
 if err != nil {
     return err
 }
 
-tx.Put(ctx, "user:1:wallet", "500")
-tx.Put(ctx, "user:2:wallet", "1500")
-
-if someError {
-    tx.Rollback()
-    return
+if err := transaction.Put(ctx, "balance:A", Account{Balance: 90}, 0); err != nil {
+    return err
 }
-
-err = tx.Commit(ctx)
+if err := transaction.Put(ctx, "balance:B", Account{Balance: 110}, 0); err != nil {
+    return err
+}
+return transaction.Commit(ctx)
 ```
 
-## Isolation Level
+## Atomic conditional writes
 
-Go-Slipstream currently implements **Read-Committed** isolation. Operations within a transaction are only visible to the rest of the system once `Commit()` is successfully completed.
+`PutIfAbsent` permits one winner when concurrent writers create the same key. `PutIf` and `DeleteIf` evaluate a predicate against the committed value while the engine write lock is held. A false predicate returns `tx.ErrConditionFailed` without a WAL write.
 
-## Performance Impact
+Conditions must be deterministic, fast, and side-effect free. They must not call back into the same engine because the commit lock is already held.
 
-Because transactions buffer operations in memory, they are extremely fast. A `Commit()` performs a sequential write of all buffered entries, which is significantly more efficient than multiple individual `Put` operations during high-load scenarios.
+```go
+err := db.PutIf(ctx, "account:1", next, 0,
+    func(current Account, exists bool) bool {
+        return exists && current.Version == expectedVersion
+    },
+)
+```
+
+The version in this example belongs to the application value. This lets each domain define its own version or generation field without a storage format dependency.
+
+## Commit-time conditions
+
+`BeginConditional` returns a transaction that supports `Require`. All requirements are evaluated against committed state immediately before the first WAL append. Requirements use AND semantics. Buffered writes do not change their inputs.
+
+```go
+transaction, err := db.BeginConditional()
+if err != nil {
+    return err
+}
+
+err = transaction.Require("project:42", func(project Project, exists bool) bool {
+    return exists && project.Version == expectedProjectVersion
+})
+if err != nil {
+    return err
+}
+err = transaction.Require("project:42:relations", func(guard Guard, exists bool) bool {
+    return exists && guard.Generation == expectedGeneration
+})
+if err != nil {
+    return err
+}
+
+if err := transaction.Put(ctx, "relation:42:memory:7", relation, 0); err != nil {
+    return err
+}
+if err := transaction.Put(ctx, "project:42:relations", nextGuard, 0); err != nil {
+    return err
+}
+return transaction.Commit(ctx)
+```
+
+Every operation that creates or deletes a relationship must update the same guard key. Parent deletion requires the parent version and the guard generation. This makes relationship creation and protected parent deletion conflict under the same lock.
+
+## Error handling
+
+- `engine.ErrKeyExists` reports a failed `PutIfAbsent`.
+- `tx.ErrConditionFailed` reports a false direct or transaction condition.
+- `tx.ErrDone` reports use after commit or rollback.
+- `tx.ErrCommitUncertain` means the commit marker may have reached storage but WAL sync failed. Reopen and recover before deciding whether to retry.

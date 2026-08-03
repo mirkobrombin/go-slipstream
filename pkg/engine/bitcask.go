@@ -39,8 +39,20 @@ func (b *Bitcask[T]) Put(ctx context.Context, key string, value T, ttl time.Dura
 	return b.engine.Put(ctx, key, value, ttl)
 }
 
+func (b *Bitcask[T]) PutIfAbsent(ctx context.Context, key string, value T, ttl time.Duration) error {
+	return b.engine.PutIfAbsent(ctx, key, value, ttl)
+}
+
+func (b *Bitcask[T]) PutIf(ctx context.Context, key string, value T, ttl time.Duration, condition tx.Condition[T]) error {
+	return b.engine.PutIf(ctx, key, value, ttl, condition)
+}
+
 func (b *Bitcask[T]) Delete(ctx context.Context, key string) error {
 	return b.engine.Delete(ctx, key)
+}
+
+func (b *Bitcask[T]) DeleteIf(ctx context.Context, key string, condition tx.Condition[T]) error {
+	return b.engine.DeleteIf(ctx, key, condition)
 }
 
 func (b *Bitcask[T]) MerkleRoot() [32]byte {
@@ -53,6 +65,10 @@ func (b *Bitcask[T]) Close() error {
 
 func (b *Bitcask[T]) Begin() (tx.Transaction[T], error) {
 	return b.engine.Begin()
+}
+
+func (b *Bitcask[T]) BeginConditional() (tx.ConditionalTransaction[T], error) {
+	return b.engine.BeginConditional()
 }
 
 func (b *Bitcask[T]) Compact() error {

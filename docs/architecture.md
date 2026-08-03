@@ -27,20 +27,25 @@ Traditional Bitcask stores ALL keys in RAM, which limits scalability. Go-Slipstr
 3. Transparently retrieves keys from either layer, allowing datasets far larger than available RAM.
 
 ### Write-Ahead Log (WAL)
-Data is appended to the WAL using `O_DIRECT` on supported systems, bypassing the OS page cache for maximum predictable performance. Each entry is encoded with `encoding/binary` for robust cross-platform compatibility.
+Data is appended to the WAL using `O_DIRECT` on supported systems, bypassing the OS page cache for predictable performance. Each entry is encoded with `encoding/binary` for consistent cross-platform decoding.
 
 ## The Write-Ahead Log (WAL)
 
 The WAL is the single source of truth. Every record is encoded with a header that includes:
 - **Type**: Put, Delete, Commit, Rollback.
+- **RecordLength**: Total framed record size.
 - **TxID**: The unique transaction identifier.
+- **ExpiresAt**: Optional absolute expiration timestamp.
 - **KeyLength**: Size of the key string.
 - **Key**: Raw key bytes.
 - **ValueLength**: Size of the (potentially compressed) value.
 - **Value**: Raw data bytes.
+- **Checksums**: CRC32C checks for the fixed header and complete record.
+
+The reader accepts the unframed format written before v1.1.0. New writes use the checksummed frame. A valid checksummed header with missing tail bytes is treated as a torn active write and truncated during open. Header or payload checksum mismatches fail recovery without truncating later records.
 
 ### O_DIRECT Performance
-On Linux systems, Go-Slipstream leverages `O_DIRECT` to bypass the kernel page cache. This ensures:
+On Linux systems, Go-Slipstream uses `O_DIRECT` to bypass the kernel page cache. This ensures:
 - **Bare-Metal Speed**: Direct communication with the storage controller.
 - **Predictable Latency**: No interference from background kernel flushes.
 - **Data Integrity**: Writes are page-aligned (`4096 bytes`) to match hardware sectors.

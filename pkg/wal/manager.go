@@ -2,7 +2,11 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,13 +18,14 @@ import (
 
 // Manager handles a collection of WAL segments.
 type Manager struct {
-	mu          sync.RWMutex
-	dir         string
-	active      *Segment
-	sealed      []*Segment
-	txID        uint64
-	maxSize     int64
-	readBufPool *sync.Pool
+	mu            sync.RWMutex
+	dir           string
+	active        *Segment
+	sealed        []*Segment
+	txID          uint64
+	maxSize       int64
+	directoryLock *os.File
+	closed        bool
 }
 
 // NewManager creates a new WAL manager.
@@ -28,21 +33,24 @@ func NewManager(dir string) (*Manager, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
+	directoryLock, err := lockDirectory(filepath.Join(dir, ".slipstream.lock"))
+	if err != nil {
+		return nil, fmt.Errorf("wal: lock %s: %w", dir, err)
+	}
 
 	m := &Manager{
-		dir:     dir,
-		maxSize: DefaultSegmentSize,
-		txID:    uint64(time.Now().UnixNano()),
-		readBufPool: &sync.Pool{
-			New: func() any {
-				// 4KB buffer for speculative reads (page aligned)
-				b := make([]byte, 4096)
-				return &b
-			},
-		},
+		dir:           dir,
+		maxSize:       DefaultSegmentSize,
+		txID:          uint64(time.Now().UnixNano()),
+		directoryLock: directoryLock,
 	}
 
 	if err := m.loadSegments(); err != nil {
+		_ = m.Close()
+		return nil, err
+	}
+	if err := m.restoreTxID(); err != nil {
+		_ = m.Close()
 		return nil, err
 	}
 
@@ -83,7 +91,9 @@ func (m *Manager) loadSegments() error {
 		if len(segmentIDs) > 0 && id == segmentIDs[len(segmentIDs)-1] {
 			m.active = seg
 		} else {
-			seg.Close()
+			if err := seg.Close(); err != nil {
+				return err
+			}
 			m.sealed = append(m.sealed, seg)
 		}
 	}
@@ -104,6 +114,13 @@ func (m *Manager) loadSegments() error {
 func (m *Manager) Append(entry Entry) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return 0, ErrClosed
+	}
+	encodedSize := uint64(checksummedMinimumEntrySize) + uint64(len(entry.Key)) + uint64(len(entry.Value))
+	if uint64(len(entry.Key)) > math.MaxUint32 || uint64(len(entry.Value)) > math.MaxUint32 || encodedSize > math.MaxUint32 {
+		return 0, ErrEntryTooLarge
+	}
 
 	data := EncodeEntry(entry)
 
@@ -126,17 +143,19 @@ func (m *Manager) rotate() error {
 	if err := m.active.Sync(); err != nil {
 		return err
 	}
-	m.active.Close()
-
-	m.sealed = append(m.sealed, m.active)
-
-	newID := m.active.ID() + 1
+	old := m.active
+	newID := old.ID() + 1
 	path := filepath.Join(m.dir, fmt.Sprintf("%016x.log", newID))
-
 	seg, err := NewSegment(newID, path, m.maxSize)
 	if err != nil {
 		return err
 	}
+	if err := old.Close(); err != nil {
+		_ = seg.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	m.sealed = append(m.sealed, old)
 	m.active = seg
 	return nil
 }
@@ -154,6 +173,10 @@ func (m *Manager) ReadEntryAt(packedOffset int64) (Entry, error) {
 	segID, offset := UnpackOffset(packedOffset)
 
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return Entry{}, ErrClosed
+	}
 	var target *Segment
 	if m.active.ID() == segID {
 		target = m.active
@@ -165,8 +188,6 @@ func (m *Manager) ReadEntryAt(packedOffset int64) (Entry, error) {
 			}
 		}
 	}
-	m.mu.RUnlock()
-
 	if target == nil {
 		return Entry{}, ErrNotFound
 	}
@@ -175,98 +196,132 @@ func (m *Manager) ReadEntryAt(packedOffset int64) (Entry, error) {
 }
 
 func (m *Manager) readEntry(seg *Segment, offset int64) (Entry, error) {
-	// Speculative read: fetch 4KB to avoid multiple syscalls
-	bufPtr := m.readBufPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer m.readBufPool.Put(bufPtr)
+	entry, _, err := decodeEntryAt(seg, offset)
+	return entry, err
+}
 
-	// Read up to buffer size or EOF (we don't know EOF yet, but ReadAt returns what it gets)
-	// We should just read 4KB. Segment logic handles boundaries?
-	// Segment.ReadAtBuffer uses file.ReadAt. file.ReadAt returns EOF if we read past.
-	// We need to know segment size or handle short read.
-	// But we passed offset.
-
-	// We try to read header (21 bytes) + some data.
-	n, err := seg.ReadAtBuffer(buf, offset)
-	if err != nil && n < 21 { // Need at least header
-		return Entry{}, err
+func decodeEntryAt(seg *Segment, offset int64) (Entry, int64, error) {
+	corrupt := func(cause error) (Entry, int64, error) {
+		return Entry{}, offset, &CorruptionError{SegmentID: seg.ID(), Offset: offset, Cause: cause}
 	}
-
-	if n < 21 {
-		return Entry{}, fmt.Errorf("wal: short read for header")
+	size := seg.Size()
+	if offset < 0 || offset >= size {
+		return corrupt(io.ErrUnexpectedEOF)
 	}
-
-	// [Type:1][TxID:8][ExpiresAt:8][KeyLen:4][Key:N][ValueLen:4][Value:M]
-	entryType := buf[0]
-	txID := binary.BigEndian.Uint64(buf[1:])
-	expiresAt := int64(binary.BigEndian.Uint64(buf[9:]))
-	if expiresAt > 0 && time.Now().UnixNano() > expiresAt {
-		return Entry{}, ErrNotFound
+	first, err := seg.ReadAt(offset, 1)
+	if err != nil {
+		return corrupt(err)
 	}
-
-	keyLen := binary.BigEndian.Uint32(buf[17:])
-
-	totalKeyOffset := 21 + int64(keyLen)
-	// Do we have key in buffer?
-	// buf has 'n' bytes.
-	// We need 21 + keyLen <= n
-
-	var key string
-	if int64(n) >= totalKeyOffset {
-		// Key is in buffer
-		key = string(buf[21:totalKeyOffset])
-	} else {
-		// Key is partial or outside. Read explicitly.
-		kBuf := make([]byte, keyLen) // Allocation unavoidable for string conversion anyway? string(buf) copies.
-		// Use ReadAt for key
-		if _, err := seg.ReadAtBuffer(kBuf, offset+21); err != nil {
-			return Entry{}, err
-		}
-		key = string(kBuf)
+	if first[0]&checksummedEntryFlag != 0 {
+		return decodeChecksummedEntryAt(seg, offset)
 	}
-
-	// Value Length
-	// Offset: totalKeyOffset. Length: 4.
-	// Check if in buffer.
-	vLenStart := totalKeyOffset
-	vLenEnd := vLenStart + 4
-
-	var valLen uint32
-	if int64(n) >= vLenEnd {
-		valLen = binary.BigEndian.Uint32(buf[vLenStart:vLenEnd])
-	} else {
-		// Read 4 bytes
-		vLenBuf := make([]byte, 4)
-		if _, err := seg.ReadAtBuffer(vLenBuf, offset+vLenStart); err != nil {
-			return Entry{}, err
-		}
-		valLen = binary.BigEndian.Uint32(vLenBuf)
+	if size-offset < 21 {
+		return corrupt(io.ErrUnexpectedEOF)
 	}
-
-	// Value
-	valStart := vLenEnd
-	valEnd := valStart + int64(valLen)
-
-	var val []byte
-	if int64(n) >= valEnd {
-		// Value in buffer.
-		val = make([]byte, valLen)
-		copy(val, buf[valStart:valEnd])
-	} else {
-		// Value outside.
-		val = make([]byte, valLen)
-		if _, err := seg.ReadAtBuffer(val, offset+valStart); err != nil {
-			return Entry{}, err
-		}
+	header, err := seg.ReadAt(offset, 21)
+	if err != nil {
+		return corrupt(err)
 	}
-
+	keyLen := int64(binary.BigEndian.Uint32(header[17:]))
+	keyStart := offset + 21
+	valueLenStart := keyStart + keyLen
+	maxInt := int64(^uint(0) >> 1)
+	if keyLen > maxInt || keyLen > size-keyStart || size-valueLenStart < 4 {
+		return corrupt(io.ErrUnexpectedEOF)
+	}
+	key, err := seg.ReadAt(keyStart, int(keyLen))
+	if err != nil {
+		return corrupt(err)
+	}
+	valueLenBytes, err := seg.ReadAt(valueLenStart, 4)
+	if err != nil {
+		return corrupt(err)
+	}
+	valueLen := int64(binary.BigEndian.Uint32(valueLenBytes))
+	valueStart := valueLenStart + 4
+	if valueLen > maxInt || valueLen > size-valueStart {
+		return corrupt(io.ErrUnexpectedEOF)
+	}
+	value, err := seg.ReadAt(valueStart, int(valueLen))
+	if err != nil {
+		return corrupt(err)
+	}
+	next := valueStart + valueLen
 	return Entry{
-		Type:      entryType,
-		TxID:      txID,
-		Key:       key,
-		Value:     val,
-		ExpiresAt: expiresAt,
-	}, nil
+		Type:      header[0],
+		TxID:      binary.BigEndian.Uint64(header[1:]),
+		ExpiresAt: int64(binary.BigEndian.Uint64(header[9:])),
+		Key:       string(key),
+		Value:     value,
+	}, next, nil
+}
+
+func decodeChecksummedEntryAt(seg *Segment, offset int64) (Entry, int64, error) {
+	corrupt := func(cause error) (Entry, int64, error) {
+		return Entry{}, offset, &CorruptionError{SegmentID: seg.ID(), Offset: offset, Cause: cause}
+	}
+	size := seg.Size()
+	remaining := size - offset
+	if remaining < checksummedHeaderSize {
+		return corrupt(ErrTornWrite)
+	}
+	header, err := seg.ReadAt(offset, checksummedHeaderSize)
+	if err != nil {
+		return corrupt(err)
+	}
+	wantHeaderChecksum := binary.BigEndian.Uint32(header[25:])
+	if crc32.Checksum(header[:25], checksumTable) != wantHeaderChecksum {
+		return corrupt(fmt.Errorf("header checksum mismatch"))
+	}
+	totalLen := int64(binary.BigEndian.Uint32(header[1:]))
+	keyLen := int64(binary.BigEndian.Uint32(header[21:]))
+	if totalLen < checksummedMinimumEntrySize || keyLen > totalLen-checksummedMinimumEntrySize {
+		return corrupt(fmt.Errorf("invalid framed lengths"))
+	}
+	if totalLen > remaining {
+		return corrupt(ErrTornWrite)
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if totalLen > maxInt {
+		return corrupt(fmt.Errorf("entry length exceeds platform limit"))
+	}
+	record, err := seg.ReadAt(offset, int(totalLen))
+	if err != nil {
+		return corrupt(err)
+	}
+	wantRecordChecksum := binary.BigEndian.Uint32(record[totalLen-4:])
+	if crc32.Checksum(record[:totalLen-4], checksumTable) != wantRecordChecksum {
+		return corrupt(fmt.Errorf("record checksum mismatch"))
+	}
+	valueLenStart := int64(checksummedHeaderSize) + keyLen
+	valueLen := int64(binary.BigEndian.Uint32(record[valueLenStart : valueLenStart+4]))
+	valueStart := valueLenStart + 4
+	valueEnd := valueStart + valueLen
+	if valueLen > maxInt || valueEnd+4 != totalLen {
+		return corrupt(fmt.Errorf("invalid value length"))
+	}
+	return Entry{
+		Type:      record[0] &^ checksummedEntryFlag,
+		TxID:      binary.BigEndian.Uint64(record[5:]),
+		ExpiresAt: int64(binary.BigEndian.Uint64(record[13:])),
+		Key:       string(record[checksummedHeaderSize:valueLenStart]),
+		Value:     append([]byte(nil), record[valueStart:valueEnd]...),
+	}, offset + totalLen, nil
+}
+
+func (m *Manager) restoreTxID() error {
+	inspect := func(entry Entry, _ int64) error {
+		if entry.TxID > m.txID {
+			m.txID = entry.TxID
+		}
+		return nil
+	}
+	for _, segment := range m.sealed {
+		if err := m.IterateSegment(segment, inspect); err != nil {
+			return err
+		}
+	}
+	return m.IterateActiveSegment(inspect)
 }
 
 func (m *Manager) NextTxID() uint64 {
@@ -279,16 +334,27 @@ func (m *Manager) NextTxID() uint64 {
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	if err := m.active.Close(); err != nil {
-		return err
+	if m.closed {
+		return nil
 	}
-	for _, s := range m.sealed {
-		if err := s.Close(); err != nil {
-			return err
+	m.closed = true
+
+	var firstErr error
+	if m.active != nil {
+		if err := m.active.Close(); err != nil {
+			firstErr = err
 		}
 	}
-	return nil
+	for _, s := range m.sealed {
+		if err := s.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if err := unlockDirectory(m.directoryLock); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	m.directoryLock = nil
+	return firstErr
 }
 
 func (m *Manager) ActiveSegmentID() uint64 {
@@ -300,6 +366,9 @@ func (m *Manager) ActiveSegmentID() uint64 {
 func (m *Manager) Sync() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
 	return m.active.Sync()
 }
 
@@ -346,45 +415,14 @@ func (m *Manager) IterateSegment(seg *Segment, fn func(e Entry, offset int64) er
 	size := seg.Size()
 
 	for offset < size {
-		header, err := seg.ReadAt(offset, 21)
+		entry, next, err := decodeEntryAt(seg, offset)
 		if err != nil {
 			return err
 		}
-
-		typ := header[0]
-		txID := binary.BigEndian.Uint64(header[1:])
-		expiresAt := int64(binary.BigEndian.Uint64(header[9:]))
-		keyLen := binary.BigEndian.Uint32(header[17:])
-
-		key, err := seg.ReadAt(offset+21, int(keyLen))
-		if err != nil {
+		if err := fn(entry, PackOffset(seg.ID(), offset)); err != nil {
 			return err
 		}
-
-		vLenOffset := offset + 21 + int64(keyLen)
-		vLenBuf, err := seg.ReadAt(vLenOffset, 4)
-		if err != nil {
-			return err
-		}
-		valLen := binary.BigEndian.Uint32(vLenBuf)
-
-		val, err := seg.ReadAt(vLenOffset+4, int(valLen))
-		if err != nil {
-			return err
-		}
-
-		err = fn(Entry{
-			Type:      typ,
-			TxID:      txID,
-			Key:       string(key),
-			Value:     val,
-			ExpiresAt: expiresAt,
-		}, PackOffset(seg.ID(), offset))
-		if err != nil {
-			return err
-		}
-
-		offset = vLenOffset + 4 + int64(valLen)
+		offset = next
 	}
 	return nil
 }
@@ -395,10 +433,50 @@ func (m *Manager) SetMaxSegmentSize(size int64) {
 	m.maxSize = size
 }
 
-func (m *Manager) IterateActiveSegment(fn func(e Entry, offset int64) error) error {
-	m.mu.RLock()
-	active := m.active
-	m.mu.RUnlock()
+// Rotate seals the active segment and starts a new one.
+func (m *Manager) Rotate() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	return m.rotate()
+}
 
-	return m.IterateSegment(active, fn)
+func (m *Manager) IterateActiveSegment(fn func(e Entry, offset int64) error) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
+	type item struct {
+		entry  Entry
+		offset int64
+	}
+	items := make([]item, 0)
+	offset := int64(0)
+	size := m.active.Size()
+	for offset < size {
+		entry, next, err := decodeEntryAt(m.active, offset)
+		if err != nil {
+			if errors.Is(err, ErrTornWrite) {
+				if truncateErr := m.active.Truncate(offset); truncateErr != nil {
+					m.mu.Unlock()
+					return truncateErr
+				}
+				break
+			}
+			m.mu.Unlock()
+			return err
+		}
+		items = append(items, item{entry: entry, offset: PackOffset(m.active.ID(), offset)})
+		offset = next
+	}
+	m.mu.Unlock()
+	for _, item := range items {
+		if err := fn(item.entry, item.offset); err != nil {
+			return err
+		}
+	}
+	return nil
 }

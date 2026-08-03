@@ -29,7 +29,7 @@ rm, _ := raft.NewManager(engine, encode, decode, cfg)
 
 - **Propose**: Linearizable write. Must be called on the Leader.
 - **Leader()**: Checks if the local node is currently the leader.
-- **AddPeer/RemovePeer**: Dynamicaly modify the cluster membership.
+- **AddPeer**: Adds a voting node to the cluster. Peer removal is not exposed yet.
 
 ## Data Persistence
 
@@ -37,4 +37,4 @@ Raft state is persisted using:
 - **Log Store/Stable Store**: Internal Slipstream Engine (`store/`)
 - **Snapshots**: Local files in `DataDir`.
 
-Snapshots are automatically taken by Raft to prune logs. Slipstream implements full state serialization for snapshots, ensuring new nodes can catch up quickly.
+Raft can take snapshots to prune logs. Slipstream serializes the current key and value set into each snapshot. Remaining TTL durations are not preserved by the current snapshot format.
