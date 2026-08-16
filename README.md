@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://github.com/mirkobrombin/go-sipstream/blob/main/logo.png?raw=true" height="128"/>
+  <img src="https://github.com/mirkobrombin/go-slipstream/blob/main/logo.png?raw=true" height="128"/>
   <h1>go-slipstream</h1>
   <p>A high-performance, distributed embedded database for Go. It combines the simplicity of Bitcask with advanced industrial features like ACID transactions, secondary indexing, and transparent compression.</p>
   <p>
