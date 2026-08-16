@@ -1,6 +1,13 @@
-# Go-Slipstream
-
-**Go-Slipstream** is a high-performance, distributed embedded database for Go. It combines the simplicity of Bitcask with advanced industrial features like ACID transactions, secondary indexing, and transparent compression.
+<div align="center">
+  <img src="https://github.com/mirkobrombin/go-sipstream/blob/main/logo.png?raw=true" height="128"/>
+  <h1>go-slipstream</h1>
+  <p>A high-performance, distributed embedded database for Go. It combines the simplicity of Bitcask with advanced industrial features like ACID transactions, secondary indexing, and transparent compression.</p>
+  <p>
+    <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go" alt="Go 1.25+">
+    <img src="https://img.shields.io/badge/runtime_deps-none-success" alt="Zero runtime dependencies">
+    <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+  </p>
+</div>
 
 Built to be "Warp-Native", it serves as a persistence layer for [go-warp](https://github.com/mirkobrombin/go-warp), with `O_DIRECT` where supported, Raft replication, and Merkle root divergence detection.
 
